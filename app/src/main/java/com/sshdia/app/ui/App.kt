@@ -30,6 +30,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -53,6 +54,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -71,11 +73,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import com.sshdia.app.data.HostProfile
 import com.sshdia.app.data.HostStore
+import com.sshdia.app.ssh.SessionManager
 import com.sshdia.app.ssh.SshClient
-import com.sshdia.app.ssh.SshShellSession
-import com.sshdia.app.terminal.TerminalEmulator
+import com.sshdia.app.terminal.TerminalInputView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -92,16 +95,28 @@ fun AppRoot() {
     val store = remember { HostStore(context) }
     var hosts by remember { mutableStateOf(store.load()) }
     var screen by remember { mutableStateOf<Screen>(Screen.HostList) }
+    var refresh by remember { mutableStateOf(0) }
 
     when (val current = screen) {
-        Screen.HostList -> HostListScreen(
-            hosts = hosts,
-            onAdd = { screen = Screen.Edit(null) },
-            onEdit = { screen = Screen.Edit(it) },
-            onDelete = { hosts = store.delete(it.id) },
-            onDuplicate = { hosts = store.duplicate(it.id) },
-            onConnect = { screen = Screen.Session(it) }
-        )
+        Screen.HostList -> {
+            val activeIds = run { refresh; SessionManager.activeIds() }
+            HostListScreen(
+                hosts = hosts,
+                activeIds = activeIds,
+                onAdd = { screen = Screen.Edit(null) },
+                onEdit = { screen = Screen.Edit(it) },
+                onDelete = {
+                    SessionManager.close(context, it.id)
+                    hosts = store.delete(it.id)
+                },
+                onDuplicate = { hosts = store.duplicate(it.id) },
+                onTerminate = {
+                    SessionManager.close(context, it.id)
+                    refresh++
+                },
+                onConnect = { screen = Screen.Session(it) }
+            )
+        }
 
         is Screen.Edit -> HostEditScreen(
             initial = current.profile,
@@ -122,10 +137,12 @@ fun AppRoot() {
 @Composable
 private fun HostListScreen(
     hosts: List<HostProfile>,
+    activeIds: Set<String>,
     onAdd: () -> Unit,
     onEdit: (HostProfile) -> Unit,
     onDelete: (HostProfile) -> Unit,
     onDuplicate: (HostProfile) -> Unit,
+    onTerminate: (HostProfile) -> Unit,
     onConnect: (HostProfile) -> Unit
 ) {
     Scaffold(
@@ -162,10 +179,12 @@ private fun HostListScreen(
                 hosts.forEach { host ->
                     HostCard(
                         host = host,
+                        active = host.id in activeIds,
                         onConnect = { onConnect(host) },
                         onEdit = { onEdit(host) },
                         onDelete = { onDelete(host) },
-                        onDuplicate = { onDuplicate(host) }
+                        onDuplicate = { onDuplicate(host) },
+                        onTerminate = { onTerminate(host) }
                     )
                 }
             }
@@ -176,10 +195,12 @@ private fun HostListScreen(
 @Composable
 private fun HostCard(
     host: HostProfile,
+    active: Boolean,
     onConnect: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
-    onDuplicate: () -> Unit
+    onDuplicate: () -> Unit,
+    onTerminate: () -> Unit
 ) {
     Card(
         modifier = Modifier
@@ -198,11 +219,17 @@ private fun HostCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = host.target,
+                    text = if (active) "● 연결됨 · ${host.target}" else host.target,
                     style = MaterialTheme.typography.bodySmall,
+                    color = if (active) Color(0xFF22C55E) else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+            }
+            if (active) {
+                IconButton(onClick = onTerminate) {
+                    Icon(Icons.Default.Stop, contentDescription = "세션 종료", tint = Color(0xFFEF4444))
+                }
             }
             IconButton(onClick = onDuplicate) {
                 Icon(Icons.Default.ContentCopy, contentDescription = "복사")
@@ -402,6 +429,7 @@ private fun ModeChip(text: String, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
+    val context = LocalContext.current.applicationContext
     val density = LocalDensity.current
     val fontSize = 13.sp
     val textStyle = remember {
@@ -412,93 +440,73 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
         )
     }
 
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    val emulator = remember { TerminalEmulator(80, 24) }
-    var session by remember { mutableStateOf<SshShellSession?>(null) }
-    var screenText by remember { mutableStateOf("") }
-    var cursorRow by remember { mutableStateOf(0) }
-    var cursorIdx by remember { mutableStateOf(0) }
-    var status by remember { mutableStateOf("연결 중...") }
-    var input by remember { mutableStateOf("") }
-    val scrollState = rememberScrollState()
-    val focusRequester = remember { FocusRequester() }
+    val session = remember(profile.id) { SessionManager.getOrCreate(context, profile) }
+    var screenText by remember { mutableStateOf(session.screenText) }
+    var cursorRow by remember { mutableStateOf(session.cursorRow) }
+    var cursorIdx by remember { mutableStateOf(session.cursorCharIndex) }
+    var status by remember { mutableStateOf(session.status) }
+    var composing by remember { mutableStateOf("") }
 
-    fun send(text: String) {
-        session?.writeText(text)
+    DisposableEffect(session) {
+        val l = {
+            screenText = session.screenText
+            cursorRow = session.cursorRow
+            cursorIdx = session.cursorCharIndex
+            status = session.status
+        }
+        session.listener = l
+        l()
+        onDispose { if (session.listener === l) session.listener = null }
     }
 
-    BoxWithConstraints(modifier = modifier) {
-        val cellW = with(density) { fontSize.toPx() } * 0.6f
-        val cellH = with(density) { fontSize.toPx() } * 1.4f
-        val widthPx = with(density) { maxWidth.toPx() }
-        val heightPx = with(density) { maxHeight.toPx() } * 0.62f
-        val padPx = with(density) { 16.dp.toPx() }
-        val cols = ((widthPx - padPx) / cellW).toInt().coerceIn(20, 400)
-        val rows = (heightPx / cellH).toInt().coerceIn(6, 200)
+    fun send(text: String) {
+        session.write(text)
+    }
 
-        DisposableEffect(profile.id) {
-            emulator.resize(cols, rows)
-            val sess = SshShellSession(
-                profile = profile,
-                cols = cols,
-                rows = rows,
-                onOutput = { data, n ->
-                    mainHandler.post {
-                        emulator.append(data, n)
-                        screenText = emulator.render()
-                        cursorRow = emulator.cursorRow
-                        cursorIdx = emulator.cursorCharIndex()
-                    }
-                },
-                onClosed = { err ->
-                    mainHandler.post {
-                        status = err?.let { "연결 종료: $it" } ?: "연결이 종료되었습니다."
-                    }
+    Column(modifier = modifier.imePadding()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(Color(0xFF0B1020))
+                .clipToBounds()
+        ) {
+            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                val cellW = with(density) { fontSize.toPx() } * 0.6f
+                val cellH = with(density) { fontSize.toPx() } * 1.45f
+                val padPx = with(density) { 16.dp.toPx() }
+                val widthPx = with(density) { maxWidth.toPx() }
+                val heightPx = with(density) { maxHeight.toPx() }
+                val cols = ((widthPx - padPx) / cellW).toInt().coerceIn(20, 400)
+                val rows = (heightPx / cellH).toInt().coerceIn(6, 200)
+
+                LaunchedEffect(cols, rows) {
+                    session.resize(cols, rows)
                 }
-            )
-            session = sess
-            status = "연결 중..."
-            sess.connect()
-            onDispose {
-                sess.close()
-                session = null
-            }
-        }
 
-        LaunchedEffect(cols, rows) {
-            emulator.resize(cols, rows)
-            session?.resize(cols, rows)
-            screenText = emulator.render()
-            cursorRow = emulator.cursorRow
-            cursorIdx = emulator.cursorCharIndex()
-        }
-
-        LaunchedEffect(screenText) {
-            scrollState.animateScrollTo(scrollState.maxValue)
-        }
-
-        Column(modifier = Modifier.fillMaxSize()) {
-            SelectionContainer(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(Color(0xFF0B1020))
-                    .verticalScroll(scrollState)
-                    .padding(8.dp)
-            ) {
-                val rendered = remember(screenText, cursorRow, cursorIdx, status) {
+                val rendered = remember(screenText, cursorRow, cursorIdx, status, composing) {
                     if (screenText.isBlank()) {
-                        buildTerminalText(status, -1, 0)
+                        buildTerminalText(status, -1, 0, "")
                     } else {
-                        buildTerminalText(screenText, cursorRow, cursorIdx)
+                        buildTerminalText(screenText, cursorRow, cursorIdx, composing)
                     }
                 }
                 Text(
                     text = rendered,
                     style = textStyle,
-                    softWrap = false
+                    softWrap = false,
+                    modifier = Modifier.padding(8.dp)
+                )
+                AndroidView(
+                    factory = { ctx -> TerminalInputView(ctx) },
+                    modifier = Modifier.matchParentSize(),
+                    update = { view ->
+                        view.onInput = { text -> send(text) }
+                        view.onComposing = { text -> composing = text }
+                    }
                 )
             }
+        }
 
             Row(
                 modifier = Modifier
@@ -532,37 +540,6 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
                 KeyButton("PgDn") { send("\u001b[6~") }
             }
 
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(8.dp)
-                    .imePadding(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    label = { Text("입력 후 Enter") },
-                    modifier = Modifier
-                        .weight(1f)
-                        .focusRequester(focusRequester),
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                    keyboardActions = KeyboardActions(
-                        onSend = {
-                            send(input + "\r")
-                            input = ""
-                            focusRequester.requestFocus()
-                        }
-                    )
-                )
-                Button(onClick = {
-                    send(input + "\r")
-                    input = ""
-                }) { Text("전송") }
-            }
-        }
     }
 }
 
@@ -576,7 +553,12 @@ private fun KeyButton(text: String, onClick: () -> Unit) {
  * row index within [text] (split on newlines); pass a negative value to disable the
  * cursor (e.g. while showing a status message).
  */
-private fun buildTerminalText(text: String, cursorRow: Int, cursorIdx: Int): AnnotatedString {
+private fun buildTerminalText(
+    text: String,
+    cursorRow: Int,
+    cursorIdx: Int,
+    composing: String
+): AnnotatedString {
     val lines = text.split('\n')
     if (cursorRow < 0 || cursorRow >= lines.size) return AnnotatedString(text)
     val idx = cursorIdx.coerceAtLeast(0)
@@ -588,6 +570,11 @@ private fun buildTerminalText(text: String, cursorRow: Int, cursorIdx: Int): Ann
                 val padded =
                     if (line.length < needed) line + " ".repeat(needed - line.length) else line
                 append(padded.substring(0, idx))
+                if (composing.isNotEmpty()) {
+                    withStyle(SpanStyle(background = Color(0xFF334155), color = Color(0xFFFFFFFF))) {
+                        append(composing)
+                    }
+                }
                 withStyle(SpanStyle(background = Color(0xFF38BDF8), color = Color(0xFF0B1020))) {
                     append(padded.substring(idx, idx + 1))
                 }
