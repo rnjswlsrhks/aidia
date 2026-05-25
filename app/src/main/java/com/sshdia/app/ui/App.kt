@@ -2,11 +2,15 @@
 
 package com.sshdia.app.ui
 
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,6 +42,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,6 +53,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -58,6 +65,8 @@ import androidx.compose.ui.unit.sp
 import com.sshdia.app.data.HostProfile
 import com.sshdia.app.data.HostStore
 import com.sshdia.app.ssh.SshClient
+import com.sshdia.app.ssh.SshShellSession
+import com.sshdia.app.terminal.TerminalEmulator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -304,36 +313,7 @@ private fun SessionScreen(
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
-
-    val scope = rememberCoroutineScope()
-    var command by remember { mutableStateOf("") }
-    var output by remember { mutableStateOf("") }
-    var running by remember { mutableStateOf(false) }
-    val scrollState = rememberScrollState()
-
-    fun run(cmd: String) {
-        if (cmd.isBlank() || running) return
-        running = true
-        scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching { SshClient.runCommand(profile, cmd) }
-            }
-            val body = result.fold(
-                onSuccess = { r -> r.output.trimEnd('\n') + "\n[exit ${r.exitStatus}]" },
-                onFailure = { e -> "[오류] ${e.message ?: e.toString()}" }
-            )
-            output = buildString {
-                append(output)
-                append("$ ").append(cmd).append('\n')
-                append(body).append("\n\n")
-            }
-            running = false
-        }
-    }
-
-    LaunchedEffect(output) {
-        scrollState.animateScrollTo(scrollState.maxValue)
-    }
+    var terminalMode by remember { mutableStateOf(true) }
 
     Scaffold(
         topBar = {
@@ -366,76 +346,272 @@ private fun SessionScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            Text(
-                text = "1단계: 명령 실행 모드입니다. 대화형 터미널(vim 등)은 다음 단계에서 추가됩니다.",
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                ModeChip("터미널", terminalMode) { terminalMode = true }
+                ModeChip("명령 실행", !terminalMode) { terminalMode = false }
+            }
 
+            if (terminalMode) {
+                TerminalPane(
+                    profile = profile,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                )
+            } else {
+                CommandPane(
+                    profile = profile,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModeChip(text: String, selected: Boolean, onClick: () -> Unit) {
+    if (selected) {
+        Button(onClick = onClick) { Text(text) }
+    } else {
+        OutlinedButton(onClick = onClick) { Text(text) }
+    }
+}
+
+@Composable
+private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
+    val density = LocalDensity.current
+    val fontSize = 13.sp
+    val textStyle = remember {
+        TextStyle(
+            fontFamily = FontFamily.Monospace,
+            fontSize = fontSize,
+            color = Color(0xFFE5E7EB)
+        )
+    }
+
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val emulator = remember { TerminalEmulator(80, 24) }
+    var session by remember { mutableStateOf<SshShellSession?>(null) }
+    var screenText by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf("연결 중...") }
+    var input by remember { mutableStateOf("") }
+    val scrollState = rememberScrollState()
+
+    fun send(text: String) {
+        session?.writeText(text)
+    }
+
+    BoxWithConstraints(modifier = modifier) {
+        val cellW = with(density) { fontSize.toPx() } * 0.6f
+        val cellH = with(density) { fontSize.toPx() } * 1.4f
+        val widthPx = with(density) { maxWidth.toPx() }
+        val heightPx = with(density) { maxHeight.toPx() } * 0.62f
+        val padPx = with(density) { 16.dp.toPx() }
+        val cols = ((widthPx - padPx) / cellW).toInt().coerceIn(20, 400)
+        val rows = (heightPx / cellH).toInt().coerceIn(6, 200)
+
+        DisposableEffect(profile.id) {
+            emulator.resize(cols, rows)
+            val sess = SshShellSession(
+                profile = profile,
+                cols = cols,
+                rows = rows,
+                onOutput = { data, n ->
+                    mainHandler.post {
+                        emulator.append(data, n)
+                        screenText = emulator.render()
+                    }
+                },
+                onClosed = { err ->
+                    mainHandler.post {
+                        status = err?.let { "연결 종료: $it" } ?: "연결이 종료되었습니다."
+                    }
+                }
+            )
+            session = sess
+            status = "연결 중..."
+            sess.connect()
+            onDispose {
+                sess.close()
+                session = null
+            }
+        }
+
+        LaunchedEffect(cols, rows) {
+            emulator.resize(cols, rows)
+            session?.resize(cols, rows)
+            screenText = emulator.render()
+        }
+
+        LaunchedEffect(screenText) {
+            scrollState.animateScrollTo(scrollState.maxValue)
+        }
+
+        Column(modifier = Modifier.fillMaxSize()) {
             SelectionContainer(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
                     .background(Color(0xFF0B1020))
                     .verticalScroll(scrollState)
-                    .padding(12.dp)
+                    .padding(8.dp)
             ) {
                 Text(
-                    text = output.ifBlank { "여기에 명령 결과가 표시됩니다.\n아래 버튼이나 입력창을 사용하세요." },
-                    color = Color(0xFFE5E7EB),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp
+                    text = screenText.ifBlank { status },
+                    style = textStyle,
+                    softWrap = false
                 )
             }
 
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                OutlinedButton(onClick = { run("uname -a") }, enabled = !running) {
-                    Text("연결 테스트")
-                }
-                OutlinedButton(
-                    onClick = { run("echo \"한글 출력 테스트 가나다라마바사\"") },
-                    enabled = !running
-                ) {
-                    Text("한글 테스트")
-                }
-                if (running) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(22.dp),
-                        strokeWidth = 2.dp
-                    )
-                }
+                KeyButton("Esc") { send("\u001b") }
+                KeyButton("Tab") { send("\t") }
+                KeyButton("Ctrl-C") { send("\u0003") }
+                KeyButton("Ctrl-D") { send("\u0004") }
+                KeyButton("↑") { send("\u001b[A") }
+                KeyButton("↓") { send("\u001b[B") }
+                KeyButton("←") { send("\u001b[D") }
+                KeyButton("→") { send("\u001b[C") }
             }
 
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(12.dp)
+                    .padding(8.dp)
                     .imePadding(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedTextField(
-                    value = command,
-                    onValueChange = { command = it },
-                    label = { Text("명령어") },
+                    value = input,
+                    onValueChange = { input = it },
+                    label = { Text("입력 후 전송") },
                     modifier = Modifier.weight(1f),
                     singleLine = true
                 )
-                Button(
-                    onClick = {
-                        val cmd = command
-                        command = ""
-                        run(cmd)
-                    },
-                    enabled = !running && command.isNotBlank()
-                ) { Text("실행") }
+                Button(onClick = {
+                    send(input + "\r")
+                    input = ""
+                }) { Text("전송") }
             }
+        }
+    }
+}
+
+@Composable
+private fun KeyButton(text: String, onClick: () -> Unit) {
+    OutlinedButton(onClick = onClick) { Text(text) }
+}
+
+@Composable
+private fun CommandPane(profile: HostProfile, modifier: Modifier) {
+    val scope = rememberCoroutineScope()
+    var command by remember { mutableStateOf("") }
+    var output by remember { mutableStateOf("") }
+    var running by remember { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
+
+    fun runCmd(cmd: String) {
+        if (cmd.isBlank() || running) return
+        running = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { SshClient.runCommand(profile, cmd) }
+            }
+            val body = result.fold(
+                onSuccess = { r -> r.output.trimEnd('\n') + "\n[exit ${r.exitStatus}]" },
+                onFailure = { e -> "[오류] ${e.message ?: e.toString()}" }
+            )
+            output = buildString {
+                append(output)
+                append("$ ").append(cmd).append('\n')
+                append(body).append("\n\n")
+            }
+            running = false
+        }
+    }
+
+    LaunchedEffect(output) {
+        scrollState.animateScrollTo(scrollState.maxValue)
+    }
+
+    Column(modifier = modifier) {
+        SelectionContainer(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(Color(0xFF0B1020))
+                .verticalScroll(scrollState)
+                .padding(12.dp)
+        ) {
+            Text(
+                text = output.ifBlank { "단발 명령을 실행하고 결과를 봅니다." },
+                color = Color(0xFFE5E7EB),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 13.sp
+            )
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedButton(onClick = { runCmd("uname -a") }, enabled = !running) {
+                Text("연결 테스트")
+            }
+            OutlinedButton(
+                onClick = { runCmd("echo \"한글 출력 테스트 가나다라마바사\"") },
+                enabled = !running
+            ) {
+                Text("한글 테스트")
+            }
+            if (running) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    strokeWidth = 2.dp
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp)
+                .imePadding(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = command,
+                onValueChange = { command = it },
+                label = { Text("명령어") },
+                modifier = Modifier.weight(1f),
+                singleLine = true
+            )
+            Button(
+                onClick = {
+                    val cmd = command
+                    command = ""
+                    runCmd(cmd)
+                },
+                enabled = !running && command.isNotBlank()
+            ) { Text("실행") }
         }
     }
 }
