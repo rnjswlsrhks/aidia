@@ -273,6 +273,22 @@ class TerminalEmulator(cols: Int, rows: Int) {
         return sb.toString()
     }
 
+    /**
+     * Code-point index of the cursor within its rendered row (as produced by
+     * [render]). Wide-character continuation cells are skipped, matching the
+     * rendering, so callers can highlight the exact cursor cell.
+     */
+    fun cursorCharIndex(): Int {
+        val r = cursorRow.coerceIn(0, screenRows - 1)
+        val limit = cursorCol.coerceIn(0, columns)
+        val row = grid[r]
+        var idx = 0
+        for (x in 0 until limit) {
+            if (row[x] != WIDE_CONT) idx++
+        }
+        return idx
+    }
+
     private companion object {
         const val BLANK = ' '.code
         const val WIDE_CONT = -1

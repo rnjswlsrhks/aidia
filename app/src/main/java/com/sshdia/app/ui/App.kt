@@ -20,12 +20,14 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.Button
@@ -51,13 +53,20 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -90,6 +99,7 @@ fun AppRoot() {
             onAdd = { screen = Screen.Edit(null) },
             onEdit = { screen = Screen.Edit(it) },
             onDelete = { hosts = store.delete(it.id) },
+            onDuplicate = { hosts = store.duplicate(it.id) },
             onConnect = { screen = Screen.Session(it) }
         )
 
@@ -115,6 +125,7 @@ private fun HostListScreen(
     onAdd: () -> Unit,
     onEdit: (HostProfile) -> Unit,
     onDelete: (HostProfile) -> Unit,
+    onDuplicate: (HostProfile) -> Unit,
     onConnect: (HostProfile) -> Unit
 ) {
     Scaffold(
@@ -153,7 +164,8 @@ private fun HostListScreen(
                         host = host,
                         onConnect = { onConnect(host) },
                         onEdit = { onEdit(host) },
-                        onDelete = { onDelete(host) }
+                        onDelete = { onDelete(host) },
+                        onDuplicate = { onDuplicate(host) }
                     )
                 }
             }
@@ -166,7 +178,8 @@ private fun HostCard(
     host: HostProfile,
     onConnect: () -> Unit,
     onEdit: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onDuplicate: () -> Unit
 ) {
     Card(
         modifier = Modifier
@@ -174,7 +187,7 @@ private fun HostCard(
             .clickable { onConnect() }
     ) {
         Row(
-            modifier = Modifier.padding(16.dp),
+            modifier = Modifier.padding(start = 16.dp, top = 4.dp, end = 4.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
@@ -190,6 +203,9 @@ private fun HostCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+            }
+            IconButton(onClick = onDuplicate) {
+                Icon(Icons.Default.ContentCopy, contentDescription = "복사")
             }
             IconButton(onClick = onEdit) {
                 Icon(Icons.Default.Edit, contentDescription = "편집")
@@ -400,9 +416,12 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
     val emulator = remember { TerminalEmulator(80, 24) }
     var session by remember { mutableStateOf<SshShellSession?>(null) }
     var screenText by remember { mutableStateOf("") }
+    var cursorRow by remember { mutableStateOf(0) }
+    var cursorIdx by remember { mutableStateOf(0) }
     var status by remember { mutableStateOf("연결 중...") }
     var input by remember { mutableStateOf("") }
     val scrollState = rememberScrollState()
+    val focusRequester = remember { FocusRequester() }
 
     fun send(text: String) {
         session?.writeText(text)
@@ -427,6 +446,8 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
                     mainHandler.post {
                         emulator.append(data, n)
                         screenText = emulator.render()
+                        cursorRow = emulator.cursorRow
+                        cursorIdx = emulator.cursorCharIndex()
                     }
                 },
                 onClosed = { err ->
@@ -448,6 +469,8 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
             emulator.resize(cols, rows)
             session?.resize(cols, rows)
             screenText = emulator.render()
+            cursorRow = emulator.cursorRow
+            cursorIdx = emulator.cursorCharIndex()
         }
 
         LaunchedEffect(screenText) {
@@ -463,8 +486,15 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
                     .verticalScroll(scrollState)
                     .padding(8.dp)
             ) {
+                val rendered = remember(screenText, cursorRow, cursorIdx, status) {
+                    if (screenText.isBlank()) {
+                        buildTerminalText(status, -1, 0)
+                    } else {
+                        buildTerminalText(screenText, cursorRow, cursorIdx)
+                    }
+                }
                 Text(
-                    text = screenText.ifBlank { status },
+                    text = rendered,
                     style = textStyle,
                     softWrap = false
                 )
@@ -490,6 +520,21 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                KeyButton("Ctrl-Z") { send("\u001a") }
+                KeyButton("Ctrl-L") { send("\u000c") }
+                KeyButton("Home") { send("\u001b[H") }
+                KeyButton("End") { send("\u001b[F") }
+                KeyButton("PgUp") { send("\u001b[5~") }
+                KeyButton("PgDn") { send("\u001b[6~") }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
                     .padding(8.dp)
                     .imePadding(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -498,9 +543,19 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
-                    label = { Text("입력 후 전송") },
-                    modifier = Modifier.weight(1f),
-                    singleLine = true
+                    label = { Text("입력 후 Enter") },
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(focusRequester),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(
+                        onSend = {
+                            send(input + "\r")
+                            input = ""
+                            focusRequester.requestFocus()
+                        }
+                    )
                 )
                 Button(onClick = {
                     send(input + "\r")
@@ -514,6 +569,34 @@ private fun TerminalPane(profile: HostProfile, modifier: Modifier) {
 @Composable
 private fun KeyButton(text: String, onClick: () -> Unit) {
     OutlinedButton(onClick = onClick) { Text(text) }
+}
+
+/**
+ * Render the terminal text, highlighting the cell at the cursor. [cursorRow] is the
+ * row index within [text] (split on newlines); pass a negative value to disable the
+ * cursor (e.g. while showing a status message).
+ */
+private fun buildTerminalText(text: String, cursorRow: Int, cursorIdx: Int): AnnotatedString {
+    val lines = text.split('\n')
+    if (cursorRow < 0 || cursorRow >= lines.size) return AnnotatedString(text)
+    val idx = cursorIdx.coerceAtLeast(0)
+    return buildAnnotatedString {
+        lines.forEachIndexed { r, line ->
+            if (r > 0) append("\n")
+            if (r == cursorRow) {
+                val needed = idx + 1
+                val padded =
+                    if (line.length < needed) line + " ".repeat(needed - line.length) else line
+                append(padded.substring(0, idx))
+                withStyle(SpanStyle(background = Color(0xFF38BDF8), color = Color(0xFF0B1020))) {
+                    append(padded.substring(idx, idx + 1))
+                }
+                append(padded.substring(idx + 1))
+            } else {
+                append(line)
+            }
+        }
+    }
 }
 
 @Composable
