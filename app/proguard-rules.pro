@@ -1,0 +1,3 @@
+# Keep JSch (uses reflection for algorithm classes)
+-keep class com.jcraft.jsch.** { *; }
+-dontwarn com.jcraft.jsch.**
