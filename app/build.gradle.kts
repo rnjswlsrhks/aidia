@@ -8,12 +8,27 @@ android {
     namespace = "com.sshdia.app"
     compileSdk = 34
 
+    // Auto-increment so each CI build installs as an update. GitHub Actions sets
+    // GITHUB_RUN_NUMBER; falls back to 0 for local builds.
+    val buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "0").toIntOrNull() ?: 0
+
     defaultConfig {
         applicationId = "com.sshdia.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 1000 + buildNumber
+        versionName = "0.1.$buildNumber"
+    }
+
+    signingConfigs {
+        // A fixed (non-secret) debug key so every build shares one signature and
+        // can be installed over the previous one without uninstalling.
+        getByName("debug") {
+            storeFile = rootProject.file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
