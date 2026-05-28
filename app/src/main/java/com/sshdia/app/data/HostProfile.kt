@@ -3,10 +3,7 @@ package com.sshdia.app.data
 import java.util.UUID
 
 /**
- * A saved SSH/SFTP connection.
- *
- * Note: credentials are stored in app-private SharedPreferences for now. Encrypted
- * storage (Android Keystore) is planned for a later step.
+ * A saved SSH/SFTP connection. Credentials are encrypted at rest by [HostStore].
  */
 data class HostProfile(
     val id: String = UUID.randomUUID().toString(),
